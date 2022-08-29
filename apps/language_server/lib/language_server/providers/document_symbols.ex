@@ -10,7 +10,15 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   require ElixirLS.LanguageServer.Protocol, as: Protocol
 
   defmodule Info do
-    defstruct [:type, :name, :location, :children, :selection_location, :symbol]
+    defstruct [
+      :type,
+      :name,
+      :location,
+      :children,
+      :selection_location,
+      :symbol,
+      :grouping_components
+    ]
   end
 
   @defs [:def, :defp, :defmacro, :defmacrop, :defguard, :defguardp, :defdelegate]
@@ -106,6 +114,11 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
       mod_defns
       |> Enum.map(&extract_symbol(module_name, &1))
       |> Enum.reject(&is_nil/1)
+      |> Enum.chunk_by(fn
+        %Info{grouping_components: {key, _components}} -> key
+        %Info{grouping_components: nil, name: name} -> name
+      end)
+      |> Enum.flat_map(&group_components/1)
 
     type =
       case defname do
@@ -203,10 +216,22 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   # Function, macro, guard with when
   defp extract_symbol(
          _current_module,
-         {defname, location, [{:when, _, [{_, head_location, _} = fn_head, _]} | _]}
+         {defname, location,
+          [{:when, _, [{short_name, head_location, args} = fn_head, when_clause]} | _]}
        )
        when defname in @defs do
     name = Macro.to_string(fn_head) |> String.replace("\n", "")
+    arity = if args, do: length(args), else: 0
+    name_arity = "#{defname} #{short_name}/#{arity}"
+
+    args =
+      Macro.to_string(args)
+      |> String.replace("\n", " ")
+      |> String.replace(~r(\s+), " ")
+      |> String.replace(~r(^\s*\[\s*), "")
+      |> String.replace(~r(\s*\]\s*$), "")
+
+    # when_clause = Macro.to_string(when_clause) |> String.replace("\n", " ")
 
     %Info{
       type: :function,
@@ -214,14 +239,27 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
       name: "#{defname} #{name}",
       location: location,
       selection_location: head_location,
-      children: []
+      children: [],
+      grouping_components: {name_arity, args}
     }
   end
 
   # Function, macro, delegate
-  defp extract_symbol(_current_module, {defname, location, [{_, head_location, _} = fn_head | _]})
+  defp extract_symbol(
+         _current_module,
+         {defname, location, [{short_name, head_location, args} = fn_head | _]}
+       )
        when defname in @defs do
     name = Macro.to_string(fn_head) |> String.replace("\n", "")
+    arity = if args, do: length(args), else: 0
+    name_arity = "#{defname} #{short_name}/#{arity}"
+
+    args =
+      Macro.to_string(args)
+      |> String.replace("\n", " ")
+      |> String.replace(~r(\s+), " ")
+      |> String.replace(~r(^\s*\[\s*), "")
+      |> String.replace(~r(\s*\]\s*$), "")
 
     %Info{
       type: :function,
@@ -229,7 +267,8 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
       name: "#{defname} #{name}",
       location: location,
       selection_location: head_location,
-      children: []
+      children: [],
+      grouping_components: {name_arity, args}
     }
   end
 
@@ -324,6 +363,44 @@ defmodule ElixirLS.LanguageServer.Providers.DocumentSymbols do
   end
 
   defp extract_symbol(_, _), do: nil
+
+  defp group_components([%Info{grouping_components: nil} = info]), do: [info]
+
+  defp group_components([%Info{grouping_components: {_, _args}} = group_prototype | _] = group) do
+    {group_key, _} = group_prototype.grouping_components
+
+    children =
+      case group do
+        [_only_one] ->
+          []
+
+        multiple ->
+          multiple
+          |> Enum.map(fn %Info{grouping_components: {_group_key, component_name}} = info ->
+            type = if info.type == :function, do: :method, else: info.type
+
+            %Info{
+              info
+              | symbol: component_name,
+                name: component_name,
+                grouping_components: nil,
+                type: type
+            }
+          end)
+      end
+
+    [
+      %Info{
+        type: group_prototype.type,
+        symbol: group_key,
+        name: group_key,
+        location: group_prototype.location,
+        selection_location: group_prototype.selection_location,
+        children: children,
+        grouping_components: {group_key}
+      }
+    ]
+  end
 
   defp build_symbol_information_hierarchical(uri, text, info) when is_list(info),
     do: Enum.map(info, &build_symbol_information_hierarchical(uri, text, &1))
